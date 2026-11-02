@@ -56,10 +56,10 @@ pub fn serve_dir(root: &Path) -> std::io::Result<StaticServer> {
                         continue;
                     }
                     let r = r.clone();
-                    let a = a.clone();
+                    let conn_active = a.clone();
                     let spawned = std::thread::Builder::new().name("static-conn".into()).spawn(move || {
                         let _ = handle(stream, &r, port);
-                        a.fetch_sub(1, Ordering::SeqCst);
+                        conn_active.fetch_sub(1, Ordering::SeqCst);
                     });
                     if spawned.is_err() {
                         a.fetch_sub(1, Ordering::SeqCst);
