@@ -578,7 +578,7 @@ fn command_never_reason(command: &str, ws: Option<&Workspace>, depth: u8) -> Opt
     if SYSTEM_COMMANDS.iter().any(|k| lower.contains(k)) {
         return Some("changes the system, its settings or its users, or shuts it down");
     }
-    if DELETES.iter().any(|k| lower.contains(k)) && deletes_outside(&lower, ws) {
+    if DELETES.iter().any(|k| lower.contains(k)) && deletes_outside(command, ws) {
         return Some("deletes anything outside the project or the temp folder");
     }
     for segment in shell_segments(command) {
@@ -592,7 +592,7 @@ fn command_never_reason(command: &str, ws: Option<&Workspace>, depth: u8) -> Opt
         if SYSTEM_COMMANDS.iter().any(|k| joined.contains(k)) {
             return Some("changes the system, its settings or its users, or shuts it down");
         }
-        if DELETES.iter().any(|k| joined.contains(k)) && deletes_outside(&joined, ws) {
+        if DELETES.iter().any(|k| joined.contains(k)) && deletes_outside(&segment.join(" "), ws) {
             return Some("deletes anything outside the project or the temp folder");
         }
         let program = segment.first().map(String::as_str).map(program_name).unwrap_or_default();
@@ -604,7 +604,7 @@ fn command_never_reason(command: &str, ws: Option<&Workspace>, depth: u8) -> Opt
                 return Some(reason);
             }
             let payload_lower = payload.to_ascii_lowercase();
-            if CODE_DELETES.iter().any(|k| payload_lower.contains(k)) && deletes_outside(&payload_lower, ws) {
+            if CODE_DELETES.iter().any(|k| payload_lower.contains(k)) && deletes_outside(&payload, ws) {
                 return Some("deletes anything outside the project or the temp folder");
             }
         }
@@ -741,10 +741,11 @@ fn deletes_outside(command: &str, ws: Option<&Workspace>) -> bool {
     let temp = std::env::temp_dir();
     let roots: Vec<PathBuf> = ws.map(|w| w.root.clone()).into_iter().chain([temp, PathBuf::from("/tmp"), PathBuf::from("c:/tmp")]).collect();
     command.split(|c: char| c.is_whitespace() || c == '"' || c == '\'').any(|tok| {
-        if tok.contains("..") || tok.starts_with('~') || tok.contains("$home") || tok.contains("%userprofile%") || tok.contains("$env:") {
+        let lower = tok.to_ascii_lowercase();
+        if tok.contains("..") || tok.starts_with('~') || lower.contains("$home") || lower.contains("%userprofile%") || lower.contains("$env:") {
             return true;
         }
-        // Git Bash writes C:\x as /c/x.
+        // Git Bash writes C:\x as /c/x. Keep the original case: macOS paths are case-preserving.
         let tok = tok.strip_prefix("/c/").map(|r| format!("c:/{r}")).unwrap_or_else(|| tok.to_string());
         let absolute = tok.starts_with('/') || tok.get(1..3).is_some_and(|d| d == ":/" || d == ":\\");
         absolute && !roots.iter().any(|r| inside(r, Path::new(&tok)))
