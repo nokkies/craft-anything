@@ -30,20 +30,22 @@ jobs:
       command: |
         set +e
         set -o pipefail
+        cargo check --workspace --all-targets --message-format=short 2>&1 | tee gate.log
+        st=${PIPESTATUS[0]}
+        if [ "$st" -ne 0 ]; then
+          grep -E "error|warning" gate.log | head -80 | while IFS= read -r line; do
+            line=${line//%/%25}
+            printf '::error::%s\n' "$line"
+          done
+          exit "$st"
+        fi
         cargo xtask ci 2>&1 | tee gate.log
         st=${PIPESTATUS[0]}
         if [ "$st" -ne 0 ]; then
-          python3 - <<'PY'
-        import pathlib
-        log = pathlib.Path('gate.log').read_text(errors='replace')
-        lines = log.splitlines()
-        keep = [l for l in lines if any(k in l for k in ('error[', 'error:', 'warning:', 'FAILED', 'panicked', 'failures:', '---- '))]
-        if not keep:
-            keep = lines[-120:]
-        for line in keep[-80:]:
-            line = line.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-            print('::error::' + line[:1500])
-        PY
+          tail -n 120 gate.log | while IFS= read -r line; do
+            line=${line//%/%25}
+            printf '::error::%s\n' "$line"
+          done
         fi
         exit "$st"
 
@@ -58,4 +60,14 @@ jobs:
       packages: ""
       tools: ""
       command: |
-        cargo test -p craft-anything-platform -p craft-anything-engine -p craft-anything-formats --locked
+        set +e
+        set -o pipefail
+        cargo test -p craft-anything-platform -p craft-anything-engine -p craft-anything-formats --locked --message-format=short 2>&1 | tee gate.log
+        st=${PIPESTATUS[0]}
+        if [ "$st" -ne 0 ]; then
+          grep -E "error|warning|FAILED|panicked" gate.log | head -80 | while IFS= read -r line; do
+            line=${line//%/%25}
+            printf '::error::%s\n' "$line"
+          done
+        fi
+        exit "$st"
