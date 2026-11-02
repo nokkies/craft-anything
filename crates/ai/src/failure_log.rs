@@ -96,7 +96,7 @@ fn render(r: &Report, date: &str, time: &str) -> String {
     s.push_str(&stream("stderr", &r.stderr));
     s.push('\n');
     s.push_str(&stream("stdout", &r.stdout));
-    redact_secrets(&s)
+    redact_secrets(s.as_str())
 }
 
 /// Write a log into `dir`, creating it, and return its path. Removes the oldest beyond [`KEEP`].

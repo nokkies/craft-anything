@@ -595,7 +595,7 @@ fn command_never_reason(command: &str, ws: Option<&Workspace>, depth: u8) -> Opt
         if DELETES.iter().any(|k| joined.contains(k)) && deletes_outside(&joined, ws) {
             return Some("deletes anything outside the project or the temp folder");
         }
-        let program = segment.first().map(|t| program_name(t)).unwrap_or_default();
+        let program = segment.first().map(String::as_str).map(program_name).unwrap_or_default();
         if program == "git" && git_alias_pushes(&segment) {
             return Some("publishes or pushes anything");
         }
@@ -728,7 +728,7 @@ fn interpreter_payload(tokens: &[String]) -> Option<String> {
         if let Some(rest) = t.strip_prefix("-c").or_else(|| t.strip_prefix("/c"))
             && !rest.is_empty()
         {
-            return Some(tokens.get(i).map(|s| s.get(2..).unwrap_or_default().to_string()).unwrap_or_default());
+            return Some(tokens.get(i).and_then(|s| s.get(2..)).unwrap_or_default().to_string());
         }
         i += 1;
     }

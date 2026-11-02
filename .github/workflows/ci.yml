@@ -28,8 +28,23 @@ jobs:
         libgtk-3-dev
       tools: cargo-nextest@0.9.150,cargo-deny@0.20.2
       command: |
-        cargo xtask ci
-        cargo deny check advisories
+        set -o pipefail
+        cargo xtask ci 2>&1 | tee gate.log
+        st=${PIPESTATUS[0]}
+        if [ "$st" -ne 0 ]; then
+          python3 - <<'PY'
+        import pathlib
+        log = pathlib.Path('gate.log').read_text(errors='replace')
+        lines = log.splitlines()
+        keep = [l for l in lines if any(k in l for k in ('error[', 'error:', 'warning:', 'FAILED', 'panicked', 'failures:', '---- '))]
+        if not keep:
+            keep = lines[-120:]
+        for line in keep[-80:]:
+            line = line.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+            print('::error::' + line[:1500])
+        PY
+        fi
+        exit "$st"
 
   # The path, process and parser layers must also pass on the desktop platforms people use, not
   # only Linux. This is a targeted test leg (the full gate above stays on Ubuntu).

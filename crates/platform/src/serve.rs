@@ -182,10 +182,10 @@ fn handle(mut stream: TcpStream, root: &Path, port: u16) -> std::io::Result<()> 
     if hosts > 1 || origins > 1 {
         return refuse(&mut stream, "400 Bad Request", "One Host header, at most one Origin.");
     }
-    if !host.is_some_and(|h| host_is_loopback(&h, Some(port))) {
+    if !host.is_some_and(|h| host_is_loopback(h.as_str(), Some(port))) {
         return refuse(&mut stream, "403 Forbidden", "This preview only answers loopback Host headers.");
     }
-    if origin.is_some_and(|o| !origin_is_local(&o)) {
+    if origin.is_some_and(|o| !origin_is_local(o.as_str())) {
         return refuse(&mut stream, "403 Forbidden", "This preview only answers local Origin headers.");
     }
     let mut parts = line.split_whitespace();
