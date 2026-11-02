@@ -23,7 +23,14 @@ cargo test -p <crates you touched>
 cargo clippy -p <crates> --all-targets -- -D warnings
 cargo xtask layers
 cargo xtask secrets
+cargo xtask ci          # the full gate: fmt, clippy, tests, wasm, tools/schemas, locks, i18n
+cargo deny check advisories   # RustSec advisories (install cargo-deny once)
 ```
+
+`rust-toolchain.toml` pins the Rust version, rustfmt and clippy, so local runs and CI use the same
+compiler. CI (`.github/workflows/ci.yml`) runs the full gate plus `cargo deny check advisories` on
+Ubuntu, and a targeted `platform`/`engine`/`formats` test leg on Windows and macOS. The shared
+workflows are SHA-pinned; bump the pin deliberately when the suite's gate changes.
 
 Enable the secret-scan hook once per clone: `git config core.hooksPath .githooks`.
 

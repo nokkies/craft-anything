@@ -42,6 +42,8 @@ pub const MIN_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const CLAUDE_CODE_RESPONSE_BYTES: usize = 80 * 1024;
 /// Longest accepted request line.
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+/// Most tool calls running at once on one connection; further calls are refused, not queued.
+const MAX_INFLIGHT: usize = 32;
 
 const INSTRUCTIONS: &str = "Craft Anything shows how software works, with evidence. Start with core_investigation_show and core_session_show. \
 Open a target with core_target_open (absolute path), then use focused tools; ask for summaries first and page for detail. \
@@ -229,8 +231,22 @@ impl Server {
             return None;
         };
         if method == "tools/call" {
+            let key = id_key(&id);
             let token = CancelToken::default();
-            self.inflight.lock().unwrap_or_else(PoisonError::into_inner).insert(id_key(&id), token.clone());
+            {
+                let mut inflight = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
+                if inflight.contains_key(&key) {
+                    drop(inflight);
+                    self.send(&error_response(id, -32600, "A call with this id is already running"));
+                    return None;
+                }
+                if inflight.len() >= MAX_INFLIGHT {
+                    drop(inflight);
+                    self.send(&error_response(id, -32000, "Too many calls are already running; wait for one to finish"));
+                    return None;
+                }
+                inflight.insert(key.clone(), token.clone());
+            }
             let me = self.clone();
             let spawned = std::thread::Builder::new().name("mcp-call".into()).spawn(move || {
                 let resp = me.tools_call(&id, &params, &token);
@@ -242,6 +258,7 @@ impl Server {
             return match spawned {
                 Ok(h) => Some(h),
                 Err(_) => {
+                    self.inflight.lock().unwrap_or_else(PoisonError::into_inner).remove(&key);
                     self.send(&error_response(msg.get("id").cloned().unwrap_or(Value::Null), -32603, "Could not start a worker"));
                     None
                 }

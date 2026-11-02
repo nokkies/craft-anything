@@ -103,7 +103,10 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
     }
     // Self-extracting archives: the directory sits later than it claims by the stub length.
     let expected_end = cd_offset.checked_add(cd_size).ok_or_else(|| ZipError::Corrupt("directory bounds overflow".into()))?;
-    let prefix = eocd_record_start.saturating_sub(expected_end);
+    if expected_end > eocd_record_start {
+        return Err(ZipError::Corrupt("central directory overlaps the end records".into()));
+    }
+    let prefix = eocd_record_start - expected_end;
     let start = usize::try_from(cd_offset.saturating_add(prefix)).map_err(|_| ZipError::Corrupt("directory offset".into()))?;
     let mut entries = Vec::new();
     let mut pos = start;
@@ -184,11 +187,16 @@ fn find_eocd(data: &[u8]) -> Option<usize> {
     }
     let from = data.len().saturating_sub(EOCD_SEARCH);
     let tail = data.get(from..)?;
-    // Search backwards so a stray signature in the comment can't shadow the real record.
+    // Search backwards so a stray signature in the comment can't shadow the real record. A
+    // candidate is only the EOCD when its comment length reaches exactly the end of the file;
+    // otherwise a fake signature inside a comment could point the parser at attacker-chosen bytes.
     let mut i = tail.len().checked_sub(22)?;
     loop {
         if tail.get(i..i + 4) == Some(b"PK\x05\x06") {
-            return Some(from + i);
+            let comment_len = usize::from(u16::from_le_bytes([tail.get(i + 20).copied()?, tail.get(i + 21).copied()?]));
+            if i.checked_add(22)?.checked_add(comment_len)? == tail.len() {
+                return Some(from + i);
+            }
         }
         if i == 0 {
             return None;
@@ -289,6 +297,27 @@ mod tests {
         out.extend_from_slice(&cd_off.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out
+    }
+
+    #[test]
+    fn eocd_comment_length_is_validated_and_directory_bounds_are_checked() {
+        let mut z = build(&[("a.txt", b"hello")]);
+        // Append a comment that itself contains an EOCD signature. The real EOCD's comment length
+        // must still describe the whole comment, and the fake signature must not be chosen.
+        let eocd = z.len() - 22;
+        let fake = b"PK\x05\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00tail";
+        z.extend_from_slice(fake);
+        let comment_len = fake.len() as u16;
+        z[eocd + 20..eocd + 22].copy_from_slice(&comment_len.to_le_bytes());
+        let a = parse(&z, 10).unwrap();
+        assert_eq!(a.entries.len(), 1);
+        assert_eq!(read_entry(&z, &a.entries[0], 100).unwrap(), b"hello");
+        // A central directory that claims to extend past the EOCD is corrupt, not an SFX prefix.
+        let mut bad = build(&[("a.txt", b"hello")]);
+        let eocd = bad.len() - 22;
+        let huge = 0xffff_ffffu32;
+        bad[eocd + 12..eocd + 16].copy_from_slice(&huge.to_le_bytes());
+        assert!(matches!(parse(&bad, 10), Err(ZipError::Corrupt(_))));
     }
 
     #[test]

@@ -364,7 +364,7 @@ impl Settings {
             .with_remediation("Update Craft Anything to change settings, or move config.toml aside to start fresh. Nothing was written."));
         }
         let text = toml::to_string_pretty(self).map_err(|e| ToolError::new(ErrorCode::BadSettings, e.to_string()))?;
-        crate::project::write_atomic(path, text.as_bytes())
+        craft_anything_platform::fs::with_record_lock(path, || craft_anything_platform::write_atomic_private(path, text.as_bytes()))
     }
 
     pub fn save(&self) -> Result<(), ToolError> {
@@ -513,6 +513,20 @@ default = "Claude Code"
         std::fs::write(&path, "mode = [[[").unwrap();
         assert_eq!(Settings::load_from(&path), Settings::default());
         assert!(path.with_extension("toml.broken").exists());
+    }
+
+    #[test]
+    fn settings_are_written_privately_and_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Settings::default().save_to(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // No temp files are left beside the record.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 name: CI
 
-# Quality gates for every push to main and every pull request (`cargo xtask ci`), through the
-# suite's shared gate workflow in craft-common-actions.
+# Quality gates for every push to main and every pull request, through the suite's shared gate
+# workflow in craft-common-actions. The shared workflow is SHA-pinned so a change there can't
+# silently change what this repository runs; bump the pin deliberately.
 on:
   push:
     branches: [main]
@@ -18,11 +19,55 @@ concurrency:
 
 jobs:
   gate:
-    # Tracks @main so suite-wide CI fixes reach every app without a PR in each repository.
-    uses: storytold/craft-common-actions/.github/workflows/gate.yml@main
+    uses: storytold/craft-common-actions/.github/workflows/gate.yml@44a7db40b1a3e99eed02c88f89f38cdd6cfffe81
     with:
       # Same craft-fonts commit as release.yml.
       craft-fonts-ref: b076417b5880bd4154bd22f00695b1d28c6bea83
       packages: >-
         libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
         libgtk-3-dev
+      tools: cargo-nextest@0.9.150,cargo-deny@0.20.2
+      command: |
+        set +e
+        set -o pipefail
+        cargo check --workspace --all-targets --message-format=short -q 2>&1 | tee gate.log
+        st=${PIPESTATUS[0]}
+        if [ "$st" -ne 0 ]; then
+          grep -E "error\[|error:|warning:" gate.log | grep -v thiserror | head -50 | while IFS= read -r line; do
+            line=${line//%/%25}
+            printf '::error::%s\n' "$line"
+          done
+          exit "$st"
+        fi
+        cargo xtask ci 2>&1 | tee gate.log
+        st=${PIPESTATUS[0]}
+        if [ "$st" -ne 0 ]; then
+          grep -E "error\[|error:|warning:|FAILED|panicked|failures:" gate.log | tail -n 50 | while IFS= read -r line; do
+            line=${line//%/%25}
+            printf '::error::%s\n' "$line"
+          done
+        fi
+        exit "$st"
+
+  # The path, process and parser layers must also pass on the desktop platforms people use, not
+  # only Linux. This is a targeted test leg (the full gate above stays on Ubuntu).
+  portable:
+    uses: storytold/craft-common-actions/.github/workflows/gate.yml@44a7db40b1a3e99eed02c88f89f38cdd6cfffe81
+    with:
+      os: '["windows-latest", "macos-latest"]'
+      craft-fonts-ref: b076417b5880bd4154bd22f00695b1d28c6bea83
+      require-craft-fonts: false
+      packages: ""
+      tools: ""
+      command: |
+        set +e
+        set -o pipefail
+        cargo test -p craft-anything-platform -p craft-anything-engine -p craft-anything-formats --locked --message-format=short -q 2>&1 | tee gate.log
+        st=${PIPESTATUS[0]}
+        if [ "$st" -ne 0 ]; then
+          grep -E "error\[|error:|warning:|panicked at|assertion|left:|right:" gate.log | grep -v thiserror | head -40 | while IFS= read -r line; do
+            line=${line//%/%25}
+            printf '::error::%s\n' "$line"
+          done
+        fi
+        exit "$st"

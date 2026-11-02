@@ -1,15 +1,22 @@
 //! A tiny static file server on loopback, for previewing and checking a built website.
 //!
-//! GET/HEAD only, one short-lived connection at a time per request thread, paths confined to the
-//! root (no `..`, symlinks resolved and re-checked), unknown extension-less paths fall back to
-//! `index.html` (single-page apps). It stops when the [`StaticServer`] is dropped.
+//! GET/HEAD only, a bounded number of short-lived connection threads, paths confined to the root
+//! (no `..`, symlinks resolved and re-checked), Host/Origin validated against loopback, unknown
+//! extension-less paths fall back to `index.html` (single-page apps). It stops when the
+//! [`StaticServer`] is dropped.
 
+use crate::standin_server::{host_is_loopback, origin_is_local};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
+
+/// Most connections served at once; the rest are refused rather than spawning unbounded threads.
+const MAX_CONNECTIONS: usize = 32;
+/// Largest request head (request line + headers) we read.
+const MAX_HEAD_BYTES: u64 = 16 * 1024;
 
 pub struct StaticServer {
     pub port: u16,
@@ -36,15 +43,27 @@ pub fn serve_dir(root: &Path) -> std::io::Result<StaticServer> {
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
     let stop = Arc::new(AtomicBool::new(false));
-    let (r, s) = (root.clone(), stop.clone());
+    let active = Arc::new(AtomicUsize::new(0));
+    let (r, s, a) = (root.clone(), stop.clone(), active.clone());
     std::thread::Builder::new().name("static-server".into()).spawn(move || {
         while !s.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    if a.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                        a.fetch_sub(1, Ordering::SeqCst);
+                        let mut stream = stream;
+                        let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        continue;
+                    }
                     let r = r.clone();
-                    let _ = std::thread::Builder::new().name("static-conn".into()).spawn(move || {
-                        let _ = handle(stream, &r);
+                    let conn_active = a.clone();
+                    let spawned = std::thread::Builder::new().name("static-conn".into()).spawn(move || {
+                        let _ = handle(stream, &r, port);
+                        conn_active.fetch_sub(1, Ordering::SeqCst);
                     });
+                    if spawned.is_err() {
+                        a.fetch_sub(1, Ordering::SeqCst);
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(15)),
                 Err(_) => std::thread::sleep(Duration::from_millis(50)),
@@ -125,50 +144,102 @@ pub fn resolve(root: &Path, url_path: &str) -> Option<PathBuf> {
     (real.starts_with(root) && real.is_file()).then_some(real)
 }
 
-fn handle(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
+fn refuse(stream: &mut TcpStream, status: &str, body: &str) -> std::io::Result<()> {
+    let head = format!("HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body.as_bytes())
+}
+
+fn handle(mut stream: TcpStream, root: &Path, port: u16) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(20)))?;
-    let mut reader = BufReader::new((&stream).take(16 * 1024));
+    let mut reader = BufReader::new((&stream).take(MAX_HEAD_BYTES));
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    // Drain the headers (bounded by `take`).
+    let mut host: Option<String> = None;
+    let mut origin: Option<String> = None;
+    let (mut hosts, mut origins) = (0, 0);
     let mut h = String::new();
     while reader.read_line(&mut h)? > 2 {
+        let trimmed = h.trim_end_matches(['\r', '\n']);
+        if let Some((name, value)) = trimmed.split_once(':') {
+            let value = value.trim().to_string();
+            match name.trim().to_ascii_lowercase().as_str() {
+                "host" => {
+                    hosts += 1;
+                    host = Some(value);
+                }
+                "origin" => {
+                    origins += 1;
+                    origin = Some(value);
+                }
+                _ => {}
+            }
+        }
         h.clear();
+    }
+    if hosts > 1 || origins > 1 {
+        return refuse(&mut stream, "400 Bad Request", "One Host header, at most one Origin.");
+    }
+    if !host.is_some_and(|h| host_is_loopback(h.as_str(), Some(port))) {
+        return refuse(&mut stream, "403 Forbidden", "This preview only answers loopback Host headers.");
+    }
+    if origin.is_some_and(|o| !origin_is_local(o.as_str())) {
+        return refuse(&mut stream, "403 Forbidden", "This preview only answers local Origin headers.");
     }
     let mut parts = line.split_whitespace();
     let (method, target) = (parts.next().unwrap_or_default(), parts.next().unwrap_or("/"));
     if method != "GET" && method != "HEAD" {
-        return stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return refuse(&mut stream, "405 Method Not Allowed", "Only GET and HEAD.");
     }
-    match resolve(root, target).and_then(|p| std::fs::read(&p).ok().map(|b| (p, b))) {
-        Some((p, body)) => {
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-                content_type(&p),
-                body.len()
-            );
-            stream.write_all(head.as_bytes())?;
-            if method == "GET" {
-                stream.write_all(&body)?;
+    let Some(path) = resolve(root, target) else {
+        return refuse(&mut stream, "404 Not Found", "Not found");
+    };
+    let mut file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return refuse(&mut stream, "404 Not Found", "Not found"),
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let head =
+        format!("HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {len}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", content_type(&path));
+    stream.write_all(head.as_bytes())?;
+    if method == "GET" {
+        // Stream instead of reading the whole file into memory; a large asset can't exhaust us.
+        let mut remaining = len;
+        let mut buf = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let n = file.read(&mut buf[..want])?;
+            if n == 0 {
+                break;
             }
-            Ok(())
+            stream.write_all(&buf[..n])?;
+            remaining = remaining.saturating_sub(n as u64);
         }
-        None => stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot found"),
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn get(port: u16, path: &str) -> String {
+    fn request(port: u16, path: &str, host: &str, origin: Option<&str>) -> String {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).unwrap();
+        let mut req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n");
+        if let Some(o) = origin {
+            req.push_str(&format!("Origin: {o}\r\n"));
+        }
+        req.push_str("\r\n");
+        s.write_all(req.as_bytes()).unwrap();
         let mut out = String::new();
         s.read_to_string(&mut out).unwrap();
         out
+    }
+
+    fn get(port: u16, path: &str) -> String {
+        request(port, path, &format!("127.0.0.1:{port}"), None)
     }
 
     #[test]
@@ -193,5 +264,21 @@ mod tests {
         let url = srv.url();
         drop(srv);
         assert!(url.starts_with("http://127.0.0.1:"));
+    }
+
+    #[test]
+    fn host_and_origin_must_be_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "ok").unwrap();
+        let srv = serve_dir(dir.path()).unwrap();
+        assert!(get(srv.port, "/").contains("ok"));
+        assert!(request(srv.port, "/", "evil.example", None).starts_with("HTTP/1.1 403"));
+        assert!(request(srv.port, "/", &format!("127.0.0.1:{}", srv.port), Some("https://evil.example")).starts_with("HTTP/1.1 403"));
+        assert!(request(srv.port, "/", &format!("localhost:{}", srv.port), Some("http://localhost:5173")).contains("ok"));
+        let mut s = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 403"), "missing Host is refused");
     }
 }

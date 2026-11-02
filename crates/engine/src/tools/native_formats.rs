@@ -919,6 +919,7 @@ mod tests {
         assert!(r["result"]["recommended_toolsets"].as_array().unwrap().iter().any(|t| t == "javascript"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn real_binary_end_to_end_if_present() {
         let Ok(bytes) = std::fs::read("/bin/ls") else { return };

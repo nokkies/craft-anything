@@ -241,6 +241,18 @@ pub(crate) fn resolve(base: &Path, p: &str) -> Option<PathBuf> {
 
 pub(crate) use crate::workspace::inside;
 
+/// A path that stays under `base` without following symlinks or Windows reparse points. `p` is
+/// already lexically resolved; a missing tail is allowed under checked parents.
+pub(crate) fn confined(base: &Path, p: &Path) -> Option<PathBuf> {
+    let rel = p.strip_prefix(base).ok()?;
+    craft_anything_platform::fs::confine(base, rel).ok()
+}
+
+/// The real path when it exists, else the lexical one (for policy checks on files not yet made).
+fn real_path(p: &Path) -> PathBuf {
+    craft_anything_platform::fs::real_path(p)
+}
+
 /// The program a command part starts (a leading quoted path keeps its spaces) and the rest.
 fn program_of(part: &str) -> (&str, &str) {
     match part.strip_prefix('"').and_then(|r| r.split_once('"')) {
@@ -318,7 +330,9 @@ pub fn decide(ws: Option<&Workspace>, tool: &str, input: &Value) -> Decision {
         "WebFetch" | "WebSearch" => "web".to_string(),
         other => other.to_string(),
     };
-    if ws.is_some_and(|w| w.manifest.allowed_actions.contains(&kind)) {
+    // A remembered "always allow" never overrules the hard rules (publishing, system changes,
+    // deleting outside the project, Craft Anything's own records).
+    if never_unasked(ws, tool, input).is_none() && ws.is_some_and(|w| w.manifest.allowed_actions.contains(&kind)) {
         return Decision::Allow;
     }
     let app = ws.map(Workspace::app_dir);
@@ -331,7 +345,11 @@ pub fn decide(ws: Option<&Workspace>, tool: &str, input: &Value) -> Decision {
             // also when the app is the project folder itself.
             let checks = ws.map(Workspace::checks_dir);
             match (&app, resolve(app.as_deref().unwrap_or(Path::new("/")), &target)) {
-                (Some(app), Some(p)) if (inside(app, &p) || checks.as_ref().is_some_and(|c| inside(c, &p))) && !ws.is_some_and(|w| w.is_own_record(&p)) => {
+                (Some(app), Some(p))
+                    if (inside(app, &p) || checks.as_ref().is_some_and(|c| inside(c, &p)))
+                        && !ws.is_some_and(|w| w.is_own_record(&p))
+                        && ws.is_none_or(|w| confined(&w.root, &p).is_some()) =>
+                {
                     Decision::Allow
                 }
                 _ => Decision::Ask { title: format!("Change a file outside the project: {target}"), kind },
@@ -413,7 +431,15 @@ pub fn off_limits(ws: Option<&Workspace>, tool: &str, input: &Value) -> Option<S
         crate::workspace::TargetRef::Local { path } => {
             // The original and, when it's one file, the folder it sits in.
             let root = if path.is_file() { path.parent().unwrap_or(path) } else { path.as_path() };
-            let touches = |p: &str| !p.is_empty() && resolve(&ws.root, p).is_some_and(|p| inside(root, &p) && !inside(&ws.root, &p));
+            let root_real = real_path(root);
+            let ws_real = real_path(&ws.root);
+            let touches = |p: &str| {
+                !p.is_empty()
+                    && resolve(&ws.root, p).is_some_and(|p| {
+                        let real = real_path(&p);
+                        inside(&root_real, &real) && !inside(&ws_real, &real)
+                    })
+            };
             match tool {
                 "Read" | "Write" | "Edit" | "MultiEdit" => touches(&s("file_path")),
                 "NotebookRead" | "NotebookEdit" => touches(&s("notebook_path")),
@@ -479,24 +505,21 @@ pub fn never_unasked(ws: Option<&Workspace>, tool: &str, input: &Value) -> Optio
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
             let target = if tool == "NotebookEdit" { s("notebook_path") } else { s("file_path") };
             let p = resolve(ws.map(|w| w.root.clone()).as_deref().unwrap_or(Path::new("/")), &target)?;
-            let system = SYSTEM_DIRS.iter().any(|d| inside(Path::new(d), &p));
+            let real = real_path(&p);
+            let system = SYSTEM_DIRS.iter().any(|d| inside(Path::new(d), &real));
             // The inbox (where answers are written), the manifest and the other records stay out of reach.
-            let ours = ws.is_some_and(|w| w.is_own_record(&p));
-            (system || ours).then(|| refuse("changes system files or Craft Anything's own records")).flatten()
-        }
-        "Bash" | "PowerShell" => {
-            let c = s("command").to_ascii_lowercase();
-            if PUBLISH.iter().any(|k| c.contains(k)) {
-                return refuse("publishes or pushes anything");
+            let ours = ws.is_some_and(|w| w.is_own_record(&p) || w.is_own_record(&real));
+            if system || ours {
+                return refuse("changes system files or Craft Anything's own records");
             }
-            if SYSTEM_COMMANDS.iter().any(|k| c.contains(k)) {
-                return refuse("changes the system, its settings or its users, or shuts it down");
-            }
-            if DELETES.iter().any(|k| c.contains(k)) && deletes_outside(&c, ws) {
-                return refuse("deletes anything outside the project or the temp folder");
+            // A link that climbs out of the project is never followed unasked, even when the
+            // lexical path looks like an ordinary file inside app/.
+            if ws.is_some_and(|w| inside(&w.root, &p) && confined(&w.root, &p).is_none()) {
+                return refuse("follows a link out of the project");
             }
             None
         }
+        "Bash" | "PowerShell" => command_never_reason(&s("command"), ws, 0).and_then(refuse),
         _ => None,
     }
 }
@@ -536,6 +559,181 @@ const SYSTEM_COMMANDS: &[&str] = &[
     "disable-netadapter",
 ];
 const DELETES: &[&str] = &["rm ", "rmdir", "rd /s", "del ", "erase ", "remove-item", "ri ", "unlink "];
+/// Deleting calls made from an interpreter's `-c` / `-e` payload (best-effort, like the shell list).
+const CODE_DELETES: &[&str] =
+    &["shutil.rmtree", "os.remove", "os.unlink", "os.rmdir", "fs.unlink", "fs.rm", "fs.rmdir", "rmsync", "unlinksync", "rmdirsync", "rimraf", "remove-item"];
+
+/// Why a command is never run unasked, if it is one. The shell lists are best-effort denylists;
+/// quote/escape-aware tokens and interpreter payloads catch the common ways around a plain
+/// `contains` check. A determined builder can still hide an action, so these are guardrails, not a
+/// sandbox.
+fn command_never_reason(command: &str, ws: Option<&Workspace>, depth: u8) -> Option<&'static str> {
+    if depth > 4 {
+        return None;
+    }
+    let lower = command.to_ascii_lowercase();
+    if PUBLISH.iter().any(|k| lower.contains(k)) {
+        return Some("publishes or pushes anything");
+    }
+    if SYSTEM_COMMANDS.iter().any(|k| lower.contains(k)) {
+        return Some("changes the system, its settings or its users, or shuts it down");
+    }
+    if DELETES.iter().any(|k| lower.contains(k)) && deletes_outside(command, ws) {
+        return Some("deletes anything outside the project or the temp folder");
+    }
+    for segment in shell_segments(command) {
+        if segment.is_empty() {
+            continue;
+        }
+        let joined = segment.join(" ").to_ascii_lowercase();
+        if PUBLISH.iter().any(|k| joined.contains(k)) {
+            return Some("publishes or pushes anything");
+        }
+        if SYSTEM_COMMANDS.iter().any(|k| joined.contains(k)) {
+            return Some("changes the system, its settings or its users, or shuts it down");
+        }
+        if DELETES.iter().any(|k| joined.contains(k)) && deletes_outside(&segment.join(" "), ws) {
+            return Some("deletes anything outside the project or the temp folder");
+        }
+        let program = segment.first().map(String::as_str).map(program_name).unwrap_or_default();
+        if program == "git" && git_alias_pushes(&segment) {
+            return Some("publishes or pushes anything");
+        }
+        if let Some(payload) = interpreter_payload(&segment) {
+            if let Some(reason) = command_never_reason(&payload, ws, depth + 1) {
+                return Some(reason);
+            }
+            let payload_lower = payload.to_ascii_lowercase();
+            if CODE_DELETES.iter().any(|k| payload_lower.contains(k)) && deletes_outside(&payload, ws) {
+                return Some("deletes anything outside the project or the temp folder");
+            }
+        }
+    }
+    None
+}
+
+/// The file name of a token, lowercased, without a folder or `.exe`.
+fn program_name(token: &str) -> String {
+    let norm = token.replace('\\', "/").to_ascii_lowercase();
+    let name = norm.rsplit('/').next().unwrap_or_default();
+    name.strip_suffix(".exe").unwrap_or(name).to_string()
+}
+
+/// Split a command into segments on unquoted `&&`, `||`, `;`, `|` and newlines, then each segment
+/// into quote/escape-aware tokens. Quotes are removed; a backslash escapes the next character
+/// outside single quotes. This is not a full shell parser, but it keeps `"git" push` and
+/// `git pu\sh` from looking unlike `git push`.
+fn shell_segments(command: &str) -> Vec<Vec<String>> {
+    let mut segments = Vec::new();
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut chars = command.chars().peekable();
+    let flush_token = |token: &mut String, tokens: &mut Vec<String>| {
+        if !token.is_empty() {
+            tokens.push(std::mem::take(token));
+        }
+    };
+    let flush_segment = |tokens: &mut Vec<String>, segments: &mut Vec<Vec<String>>| {
+        if !tokens.is_empty() {
+            segments.push(std::mem::take(tokens));
+        }
+    };
+    while let Some(c) = chars.next() {
+        if escaped {
+            token.push(c);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    token.push(c);
+                }
+            }
+            Some('"') => {
+                if c == '"' {
+                    quote = None;
+                } else if c == '\\' {
+                    escaped = true;
+                } else {
+                    token.push(c);
+                }
+            }
+            Some(_) => {}
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '\\' => escaped = true,
+                '&' | '|' | ';' | '\n' => {
+                    flush_token(&mut token, &mut tokens);
+                    flush_segment(&mut tokens, &mut segments);
+                    // Consume the second character of `&&` / `||`.
+                    if (c == '&' || c == '|') && chars.peek() == Some(&c) {
+                        chars.next();
+                    }
+                }
+                c if c.is_whitespace() => flush_token(&mut token, &mut tokens),
+                c => token.push(c),
+            },
+        }
+    }
+    flush_token(&mut token, &mut tokens);
+    flush_segment(&mut tokens, &mut segments);
+    segments
+}
+
+/// A `git -c alias.name=push` (or `=!…`) definition that would push, or a plain `git push` token.
+fn git_alias_pushes(tokens: &[String]) -> bool {
+    let mut i = 1;
+    while i < tokens.len() {
+        let t = tokens.get(i).map(String::as_str).unwrap_or_default();
+        if t == "push" {
+            return true;
+        }
+        if t == "-c"
+            && let Some(def) = tokens.get(i + 1)
+            && let Some((name, value)) = def.split_once('=')
+            && name.starts_with("alias.")
+        {
+            let value = value.trim_matches(|c| c == '\'' || c == '"').to_ascii_lowercase();
+            if value.contains("push") || value.contains("publish") || value.starts_with('!') {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The payload of an interpreter one-liner (`python -c`, `node -e`, `powershell -Command`…).
+fn interpreter_payload(tokens: &[String]) -> Option<String> {
+    let program = tokens.first().map(|t| program_name(t))?;
+    let flags: &[&str] = match program.as_str() {
+        "python" | "python3" | "py" => &["-c"],
+        "node" | "nodejs" | "ruby" | "perl" => &["-e", "-c"],
+        "sh" | "bash" | "zsh" | "dash" | "cmd" => &["-c", "/c"],
+        "powershell" | "pwsh" => &["-command", "-c"],
+        _ => return None,
+    };
+    let mut i = 1;
+    while i < tokens.len() {
+        let t = tokens.get(i).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+        if flags.iter().any(|f| t == *f) {
+            return tokens.get(i + 1).cloned();
+        }
+        // Attached forms: `-cCODE`, `/cCODE`.
+        if let Some(rest) = t.strip_prefix("-c").or_else(|| t.strip_prefix("/c"))
+            && !rest.is_empty()
+        {
+            return Some(tokens.get(i).and_then(|s| s.get(2..)).unwrap_or_default().to_string());
+        }
+        i += 1;
+    }
+    None
+}
 
 /// Whether a deleting command reaches outside the project folder (and the temp folder): any
 /// absolute, home-relative or climbing path that isn't inside them.
@@ -543,10 +741,11 @@ fn deletes_outside(command: &str, ws: Option<&Workspace>) -> bool {
     let temp = std::env::temp_dir();
     let roots: Vec<PathBuf> = ws.map(|w| w.root.clone()).into_iter().chain([temp, PathBuf::from("/tmp"), PathBuf::from("c:/tmp")]).collect();
     command.split(|c: char| c.is_whitespace() || c == '"' || c == '\'').any(|tok| {
-        if tok.contains("..") || tok.starts_with('~') || tok.contains("$home") || tok.contains("%userprofile%") || tok.contains("$env:") {
+        let lower = tok.to_ascii_lowercase();
+        if tok.contains("..") || tok.starts_with('~') || lower.contains("$home") || lower.contains("%userprofile%") || lower.contains("$env:") {
             return true;
         }
-        // Git Bash writes C:\x as /c/x.
+        // Git Bash writes C:\x as /c/x. Keep the original case: macOS paths are case-preserving.
         let tok = tok.strip_prefix("/c/").map(|r| format!("c:/{r}")).unwrap_or_else(|| tok.to_string());
         let absolute = tok.starts_with('/') || tok.get(1..3).is_some_and(|d| d == ":/" || d == ":\\");
         absolute && !roots.iter().any(|r| inside(r, Path::new(&tok)))
@@ -626,6 +825,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let game = dir.path().join("Games").join("Some Game");
         std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("data.ini"), "original").unwrap();
         let w = Workspace::create(&dir.path().join("projects"), "g", "Recreate this game", TargetRef::Local { path: game.clone() }).unwrap();
         let inbox = || Some(Inbox::new(w.inbox_dir()));
         let file = |p: &std::path::Path| json!({"file_path": p.join("data.ini").display().to_string()});
@@ -730,6 +930,51 @@ mod tests {
         w.manifest.allowed_actions.push("bash:lsblk".into());
         assert_eq!(decide(Some(&w), "Bash", &cmd), Decision::Allow, "\"always for this project\" is remembered");
         assert_eq!(decide(None, "Read", &json!({})), Decision::Allow);
+    }
+
+    #[test]
+    fn remembered_allow_never_overrules_the_hard_rules() {
+        let (_d, mut w) = ws();
+        w.manifest.allowed_actions.push("bash:git".into());
+        let push = json!({"command": "git push"});
+        assert!(matches!(decide(Some(&w), "Bash", &push), Decision::Ask { .. }), "a remembered kind still asks for a push");
+        let inbox = Some(Inbox::new(w.inbox_dir()));
+        let out = approve_with(inbox, true, false, "Bash", &push, &|| false, &mut || {}).unwrap();
+        assert!(out.is_err(), "Auto mode refuses it instead of running it");
+    }
+
+    #[test]
+    fn quoted_aliased_and_interpreter_bypasses_are_still_never_unasked() {
+        let (_d, w) = ws();
+        for command in [
+            "\"git\" push",
+            "git pu\\sh",
+            "git -c alias.x=push x",
+            "python -c \"import shutil; shutil.rmtree('/etc/x')\"",
+            "node -e \"require('fs').rmSync('/etc/x', {recursive:true})\"",
+            "powershell -Command \"Remove-Item -Recurse C:/Windows/x\"",
+        ] {
+            assert!(never_unasked(Some(&w), "Bash", &json!({"command": command})).is_some(), "{command}");
+        }
+        // Ordinary build commands and in-project deletes stay allowed.
+        for command in ["git clone https://example.com/x", "python -I c:/tmp/dz5/props.py", "rm -rf ./Intermediate"] {
+            assert!(never_unasked(Some(&w), "Bash", &json!({"command": command})).is_none(), "{command}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_room_refuses_a_link_that_reaches_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("data.ini"), "original").unwrap();
+        let w = Workspace::create(&dir.path().join("projects"), "g", "Recreate it", TargetRef::Local { path: game.clone() }).unwrap();
+        std::fs::create_dir_all(w.app_dir()).unwrap();
+        std::os::unix::fs::symlink(game.join("data.ini"), w.app_dir().join("peek.ini")).unwrap();
+        let input = json!({"file_path": w.app_dir().join("peek.ini").display().to_string()});
+        assert!(off_limits(Some(&w), "Read", &input).is_some());
+        assert!(never_unasked(Some(&w), "Write", &input).is_some());
     }
 
     #[test]

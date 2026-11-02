@@ -725,22 +725,26 @@ impl Workspace {
     /// they are on disk, so a writer holding an older copy (a run that started before the person
     /// raised the budget) can't undo their change.
     pub fn save(&self) -> Result<(), ToolError> {
-        let mut m = self.manifest.clone();
-        if let Ok(disk) = Workspace::open(&self.root) {
-            m.take_person_fields(&disk.manifest);
-        }
-        self.write_manifest(&m)
+        craft_anything_platform::fs::with_record_lock(&self.root.join(MANIFEST), || {
+            let mut m = self.manifest.clone();
+            if let Ok(disk) = Workspace::open(&self.root) {
+                m.take_person_fields(&disk.manifest);
+            }
+            self.write_manifest(&m)
+        })
     }
 
     /// Change the fields the person owns (the asset budget, whether assets are generated, the
     /// actions always allowed): start from what's on disk, apply `f` and save. This is the only
     /// way they change.
     pub fn set_person(&mut self, f: impl FnOnce(&mut Manifest)) -> Result<(), ToolError> {
-        if let Ok(disk) = Workspace::open(&self.root) {
-            self.manifest.take_person_fields(&disk.manifest);
-        }
-        f(&mut self.manifest);
-        self.write_manifest(&self.manifest)
+        craft_anything_platform::fs::with_record_lock(&self.root.join(MANIFEST), || {
+            if let Ok(disk) = Workspace::open(&self.root) {
+                self.manifest.take_person_fields(&disk.manifest);
+            }
+            f(&mut self.manifest);
+            self.write_manifest(&self.manifest)
+        })
     }
 
     fn write_manifest(&self, m: &Manifest) -> Result<(), ToolError> {
@@ -782,7 +786,11 @@ impl Workspace {
     /// the person's pictures…), which the builder never changes, even when the app is the
     /// project folder itself. checks/ isn't one: the builder keeps its notes there.
     pub fn is_own_record(&self, p: &Path) -> bool {
-        OWN_NAMES.iter().filter(|n| **n != "checks").any(|n| inside(&self.root.join(n), p))
+        let real = craft_anything_platform::fs::real_path(p);
+        OWN_NAMES.iter().filter(|n| **n != "checks").any(|n| {
+            let own = self.root.join(n);
+            inside(&own, p) || inside(&own, &real)
+        })
     }
     /// Separate from capture/, which a website study replaces.
     pub fn reference_dir(&self) -> PathBuf {
@@ -1062,6 +1070,25 @@ mod tests {
         run.set_person(|m| m.asset_budget_usd = 25.0).unwrap();
         let disk = Workspace::open(&run.root).unwrap().manifest;
         assert_eq!((disk.asset_budget_usd, disk.generate_assets), (25.0, true));
+    }
+
+    #[test]
+    fn concurrent_person_changes_are_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Workspace::create(dir.path(), "game", "x", TargetRef::None).unwrap().root;
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let root = root.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut w = Workspace::open(&root).unwrap();
+                w.set_person(|m| m.allowed_actions.push(format!("bash:tool-{i}"))).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let disk = Workspace::open(&root).unwrap().manifest;
+        assert_eq!(disk.allowed_actions.len(), 8, "every writer's change survived: {:?}", disk.allowed_actions);
     }
 
     #[test]
