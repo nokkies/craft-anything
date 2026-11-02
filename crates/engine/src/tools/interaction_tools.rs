@@ -250,7 +250,7 @@ pub(crate) fn confined(base: &Path, p: &Path) -> Option<PathBuf> {
 
 /// The real path when it exists, else the lexical one (for policy checks on files not yet made).
 fn real_path(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    craft_anything_platform::fs::real_path(p)
 }
 
 /// The program a command part starts (a leading quoted path keeps its spaces) and the rest.
@@ -968,6 +968,7 @@ mod tests {
         std::fs::create_dir_all(&game).unwrap();
         std::fs::write(game.join("data.ini"), "original").unwrap();
         let w = Workspace::create(&dir.path().join("projects"), "g", "Recreate it", TargetRef::Local { path: game.clone() }).unwrap();
+        std::fs::create_dir_all(w.app_dir()).unwrap();
         std::os::unix::fs::symlink(game.join("data.ini"), w.app_dir().join("peek.ini")).unwrap();
         let input = json!({"file_path": w.app_dir().join("peek.ini").display().to_string()});
         assert!(off_limits(Some(&w), "Read", &input).is_some());

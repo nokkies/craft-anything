@@ -442,6 +442,7 @@ mod tests {
     #[test]
     fn links_inside_the_project_are_not_followed() {
         let (_d, ws, e) = building();
+        std::fs::create_dir_all(ws.app_dir()).unwrap();
         let outside = ws.root.parent().unwrap().join("outside.txt");
         std::fs::write(&outside, "secret").unwrap();
         std::os::unix::fs::symlink(&outside, ws.app_dir().join("link.txt")).unwrap();

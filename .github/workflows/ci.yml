@@ -65,7 +65,7 @@ jobs:
         cargo test -p craft-anything-platform -p craft-anything-engine -p craft-anything-formats --locked --message-format=short -q 2>&1 | tee gate.log
         st=${PIPESTATUS[0]}
         if [ "$st" -ne 0 ]; then
-          grep -E "error\[|error:|warning:|FAILED|panicked" gate.log | grep -v thiserror | head -50 | while IFS= read -r line; do
+          grep -E -A6 "error\[|error:|warning:|FAILED|panicked at" gate.log | grep -v thiserror | head -120 | while IFS= read -r line; do
             line=${line//%/%25}
             printf '::error::%s\n' "$line"
           done

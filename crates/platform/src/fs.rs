@@ -139,6 +139,23 @@ pub fn path_is_link(path: &Path) -> bool {
     std::fs::symlink_metadata(path).map(|m| metadata_is_link(&m)).unwrap_or(false)
 }
 
+/// The canonical path when it exists, else the lexical one. On Windows the `\\?\` verbatim prefix
+/// is removed so the result compares equal to ordinary paths in policy checks.
+pub fn real_path(path: &Path) -> PathBuf {
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        let text = real.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    real
+}
+
 /// Resolve `rel` under `root`, refusing to follow symlinks or Windows reparse points. `root` is
 /// canonicalized first; a missing tail is allowed only under components that were checked. This is
 /// a best-effort check-then-use guard: callers that create directories should re-check afterwards.

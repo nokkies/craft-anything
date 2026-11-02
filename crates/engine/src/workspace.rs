@@ -786,7 +786,7 @@ impl Workspace {
     /// the person's pictures…), which the builder never changes, even when the app is the
     /// project folder itself. checks/ isn't one: the builder keeps its notes there.
     pub fn is_own_record(&self, p: &Path) -> bool {
-        let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let real = craft_anything_platform::fs::real_path(p);
         OWN_NAMES.iter().filter(|n| **n != "checks").any(|n| {
             let own = self.root.join(n);
             inside(&own, p) || inside(&own, &real)
