@@ -30,10 +30,10 @@ jobs:
       command: |
         set +e
         set -o pipefail
-        cargo check --workspace --all-targets --message-format=short 2>&1 | tee gate.log
+        cargo check --workspace --all-targets --message-format=short -q 2>&1 | tee gate.log
         st=${PIPESTATUS[0]}
         if [ "$st" -ne 0 ]; then
-          grep -E "error|warning" gate.log | head -80 | while IFS= read -r line; do
+          grep -E "error\[|error:|warning:" gate.log | grep -v thiserror | head -50 | while IFS= read -r line; do
             line=${line//%/%25}
             printf '::error::%s\n' "$line"
           done
@@ -42,7 +42,7 @@ jobs:
         cargo xtask ci 2>&1 | tee gate.log
         st=${PIPESTATUS[0]}
         if [ "$st" -ne 0 ]; then
-          tail -n 120 gate.log | while IFS= read -r line; do
+          grep -E "error\[|error:|warning:|FAILED|panicked|failures:" gate.log | tail -n 50 | while IFS= read -r line; do
             line=${line//%/%25}
             printf '::error::%s\n' "$line"
           done
@@ -62,10 +62,10 @@ jobs:
       command: |
         set +e
         set -o pipefail
-        cargo test -p craft-anything-platform -p craft-anything-engine -p craft-anything-formats --locked --message-format=short 2>&1 | tee gate.log
+        cargo test -p craft-anything-platform -p craft-anything-engine -p craft-anything-formats --locked --message-format=short -q 2>&1 | tee gate.log
         st=${PIPESTATUS[0]}
         if [ "$st" -ne 0 ]; then
-          grep -E "error|warning|FAILED|panicked" gate.log | head -80 | while IFS= read -r line; do
+          grep -E "error\[|error:|warning:|FAILED|panicked" gate.log | grep -v thiserror | head -50 | while IFS= read -r line; do
             line=${line//%/%25}
             printf '::error::%s\n' "$line"
           done
