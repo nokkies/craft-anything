@@ -46,8 +46,33 @@ fn stream(name: &str, bytes: &[u8]) -> String {
     }
     let start = bytes.len().saturating_sub(MAX_STREAM_BYTES);
     let kept = String::from_utf8_lossy(bytes.get(start..).unwrap_or_default());
+    let kept = redact_secrets(&kept);
     let note = if start > 0 { format!(" (the last {} of {} bytes)", bytes.len() - start, bytes.len()) } else { String::new() };
     format!("--- {name}{note} ---\n{kept}\n")
+}
+
+/// Hide credential-shaped text before a failure log is written. This is a best-effort net for
+/// output we didn't produce (a builder's compiler, a package manager, a test harness); the command
+/// itself is already masked by `printable_command`.
+pub fn redact_secrets(text: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static BEARER: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
+    static ASSIGN: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
+    static TOKEN: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
+    let mut out = text.to_string();
+    if let Ok(re) = BEARER.get_or_init(|| Regex::new(r"(?i)(bearer\s+)[a-z0-9._~+/=-]+")) {
+        out = re.replace_all(&out, "${1}[redacted]").into_owned();
+    }
+    if let Ok(re) =
+        ASSIGN.get_or_init(|| Regex::new(r#"(?i)((?:api[_-]?key|apikey|token|secret|password|passwd|authorization|credential)["']?\s*[:=]\s*["']?)[^\s"',;]+"#))
+    {
+        out = re.replace_all(&out, "${1}[redacted]").into_owned();
+    }
+    if let Ok(re) = TOKEN.get_or_init(|| Regex::new(r"\b(?:sk-[a-zA-Z0-9_-]{8,}|ghp_[a-zA-Z0-9]{20,}|xox[baprs]-[a-zA-Z0-9-]{10,})\b")) {
+        out = re.replace_all(&out, "[redacted]").into_owned();
+    }
+    out
 }
 
 fn render(r: &Report, date: &str, time: &str) -> String {
@@ -71,7 +96,7 @@ fn render(r: &Report, date: &str, time: &str) -> String {
     s.push_str(&stream("stderr", &r.stderr));
     s.push('\n');
     s.push_str(&stream("stdout", &r.stdout));
-    s
+    redact_secrets(&s)
 }
 
 /// Write a log into `dir`, creating it, and return its path. Removes the oldest beyond [`KEEP`].
@@ -128,6 +153,19 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn secrets_are_redacted_from_streams_and_rendered_logs() {
+        let text = "Authorization: Bearer abc123_DEF-456\napi_key=sk-test1234567890\ntoken: ghp_abcdefghijklmnopqrst\npassword = \"hunter2\"\n";
+        let red = redact_secrets(text);
+        for gone in ["abc123_DEF-456", "sk-test1234567890", "ghp_abcdefghijklmnopqrst", "hunter2"] {
+            assert!(!red.contains(gone), "{gone}: {red}");
+        }
+        assert!(red.contains("[redacted]"));
+        let report = Report { stderr: text.as_bytes().to_vec(), ..Default::default() };
+        let rendered = render(&report, "2026-01-01", "00:00:00");
+        assert!(!rendered.contains("hunter2") && rendered.contains("[redacted]"));
     }
 
     #[test]

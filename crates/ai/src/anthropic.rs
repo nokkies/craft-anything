@@ -297,7 +297,7 @@ impl ChatModel for Anthropic {
         let agent = http::stream_agent();
         let reader = http::post_json(&agent, "Anthropic", &self.url("messages"), &self.headers(), &self.body(req))?;
         let mut state = StreamState::default();
-        http::parse_sse(reader, |ev| {
+        http::parse_sse_with_cancel(reader, &|| stop.is_stopped(), |ev| {
             stop.check()?;
             state.apply(&ev, on_delta)?;
             Ok(!state.done)

@@ -6,7 +6,7 @@
 //! dev servers are refused, anything else asks the person (or goes ahead in Auto mode, except
 //! what's never done unasked). Ids follow docs/tool-ids.md.
 
-use super::interaction_tools::{approve, inbox, inside, resolve, workspace_of};
+use super::interaction_tools::{approve, confined, inbox, inside, resolve, workspace_of};
 use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
 use crate::workspace::Workspace;
 use craft_anything_evidence::{ErrorCode, ToolError};
@@ -200,9 +200,13 @@ fn in_project(ws: &Workspace, rel: &str) -> Result<PathBuf, ToolError> {
     let from_root = rel.trim_start_matches(['/', '\\']);
     let names_a_folder = from_root != rel
         && from_root.split(['/', '\\']).next().is_some_and(|first| !first.is_empty() && (ws.root.join(first).is_dir() || ws.root.join(first) == ws.app_dir()));
-    [Some(rel), names_a_folder.then_some(from_root)].into_iter().flatten().find_map(|r| resolve(&ws.root, r).filter(|p| inside(&ws.root, p))).ok_or_else(|| {
-        ToolError::invalid(format!("{rel} is outside the project.")).with_remediation("Use a path relative to the project folder, like app/src/main.rs.")
-    })
+    [Some(rel), names_a_folder.then_some(from_root)]
+        .into_iter()
+        .flatten()
+        .find_map(|r| resolve(&ws.root, r).filter(|p| inside(&ws.root, p)).and_then(|p| confined(&ws.root, &p)))
+        .ok_or_else(|| {
+            ToolError::invalid(format!("{rel} is outside the project.")).with_remediation("Use a path relative to the project folder, like app/src/main.rs.")
+        })
 }
 
 fn shown(ws: &Workspace, p: &Path) -> String {
@@ -232,6 +236,10 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
             }
             let path = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
+            // Never list or descend through a link: it could point outside the project.
+            if craft_anything_platform::fs::path_is_link(&path) {
+                continue;
+            }
             if path.is_dir() {
                 entries.push(json!({"path": format!("{}/", shown(&ws, &path))}));
                 if d + 1 < depth && !SKIP.contains(&name.as_str()) {
@@ -277,7 +285,11 @@ fn write_checked(ctx: &mut Ctx<'_>, path: &Path, content: &str) -> Result<(), To
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| ToolError::io(dir.display(), e))?;
     }
-    crate::project::write_atomic(path, content.as_bytes())
+    // Re-check after creating directories: a parent could have been replaced by a link while the
+    // approval was waiting.
+    let ws = workspace(ctx)?;
+    let path = confined(&ws.root, path).ok_or_else(|| refused(format!("{} is outside the project.", path.display())))?;
+    crate::project::write_atomic(&path, content.as_bytes())
 }
 
 fn build_file_write(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
@@ -424,6 +436,23 @@ mod tests {
         assert_eq!((ok["steps"].as_u64(), ok["done"].as_u64()), (Some(2), Some(1)));
         assert!(call(&e, "build_checklist", json!({"todos": [{"content": "x", "status": "maybe"}]})).is_err());
         assert!(call(&e, "build_checklist", json!({"todos": []})).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_inside_the_project_are_not_followed() {
+        let (_d, ws, e) = building();
+        let outside = ws.root.parent().unwrap().join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.app_dir().join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(ws.root.parent().unwrap(), ws.app_dir().join("linkdir")).unwrap();
+        assert!(call(&e, "build_file_read", json!({"path": "app/link.txt"})).is_err());
+        assert!(call(&e, "build_file_write", json!({"path": "app/link.txt", "content": "x"})).is_err());
+        assert!(call(&e, "build_file_write", json!({"path": "app/linkdir/evil.txt", "content": "x"})).is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
+        let list = call(&e, "build_files_list", json!({})).unwrap();
+        assert!(!list["entries"].to_string().contains("link.txt"), "{list}");
+        assert!(!list["entries"].to_string().contains("linkdir"), "{list}");
     }
 
     #[test]

@@ -119,7 +119,7 @@ impl OpenAi {
         let agent = http::stream_agent();
         let reader = http::post_json(&agent, &self.label, &self.url("chat/completions"), &self.headers(), &self.body(req))?;
         let mut st = ChatStream::default();
-        http::parse_sse(reader, |ev| {
+        http::parse_sse_with_cancel(reader, &|| stop.is_stopped(), |ev| {
             stop.check()?;
             st.apply(&ev, on_delta)?;
             Ok(!st.done)

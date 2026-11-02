@@ -213,33 +213,10 @@ impl Project {
 }
 
 /// Write `bytes` to `path` atomically: a sibling temp file, fsync, then rename.
+/// Delegates to the platform writer so every record gets the same collision-safe temp names and
+/// Windows rename retry.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
-    use std::io::Write as _;
-    let dir = path.parent().ok_or_else(|| ToolError::invalid(format!("{} has no parent folder", path.display())))?;
-    std::fs::create_dir_all(dir).map_err(|e| ToolError::io(dir.display(), e))?;
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&tmp).map_err(|e| ToolError::io(tmp.display(), e))?;
-        f.write_all(bytes).map_err(|e| ToolError::io(tmp.display(), e))?;
-        f.sync_all().map_err(|e| ToolError::io(tmp.display(), e))?;
-    }
-    // On Windows a file another program has open for a moment (an antivirus scan, the search
-    // indexer) can't be replaced: try again briefly before giving up.
-    let mut tries = 0;
-    loop {
-        match std::fs::rename(&tmp, path) {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && tries < 20 => {
-                tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(ToolError::io(path.display(), e));
-            }
-        }
-    }
+    craft_anything_platform::write_atomic(path, bytes)
 }
 
 #[cfg(test)]

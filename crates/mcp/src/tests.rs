@@ -282,3 +282,29 @@ fn claude_code_connections_get_a_budget_that_fits_its_limit() {
     set.handle_request("initialize", &hello("claude-code")).unwrap();
     assert_eq!(set.budget(), 500_000, "an explicit budget wins");
 }
+
+#[test]
+fn inflight_calls_are_bounded_and_ids_are_unique() {
+    let buf = Buf::default();
+    let server = Arc::new(Server::new(Arc::new(Engine::new(craft_anything_engine::testing::session())), ServerOptions::default(), Box::new(buf.clone())));
+    // A call with the same id is already running: refused, not started twice.
+    server.inflight.lock().unwrap().insert("1".to_string(), CancelToken::default());
+    let h = server.clone().handle_line(&req(1, "tools/call", json!({"name": "core_session_show", "arguments": {}})).to_string());
+    assert!(h.is_none());
+    let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    let v: Value = serde_json::from_str(out.lines().last().unwrap()).unwrap();
+    assert_eq!(v["error"]["code"], -32600);
+
+    // Fill the connection's worker budget; the next call is refused instead of spawning.
+    let buf2 = Buf::default();
+    let server2 = Arc::new(Server::new(Arc::new(Engine::new(craft_anything_engine::testing::session())), ServerOptions::default(), Box::new(buf2.clone())));
+    for i in 0..MAX_INFLIGHT {
+        server2.inflight.lock().unwrap().insert(format!("busy-{i}"), CancelToken::default());
+    }
+    let h = server2.clone().handle_line(&req(99, "tools/call", json!({"name": "core_session_show", "arguments": {}})).to_string());
+    assert!(h.is_none());
+    let out = String::from_utf8(buf2.0.lock().unwrap().clone()).unwrap();
+    let v: Value = serde_json::from_str(out.lines().last().unwrap()).unwrap();
+    assert_eq!(v["id"], 99);
+    assert_eq!(v["error"]["code"], -32000);
+}

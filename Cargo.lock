@@ -1148,6 +1148,7 @@ dependencies = [
  "dirs",
  "keyring",
  "log",
+ "regex",
  "schemars",
  "serde",
  "serde_json",

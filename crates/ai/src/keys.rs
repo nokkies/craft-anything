@@ -52,6 +52,17 @@ pub fn env_var(kind: BackendKind) -> Option<&'static str> {
     }
 }
 
+/// Outcome of trying to delete a key from the OS keychain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Deleted,
+    NotFound,
+    /// No usable keychain (locked, missing, or no storage access).
+    Unavailable,
+    /// The keychain was reached but refused the operation, or the call timed out.
+    Failed,
+}
+
 /// Where keys live.
 #[derive(Debug, Clone)]
 pub struct KeyStore {
@@ -115,14 +126,27 @@ impl KeyStore {
     }
 
     pub fn delete(&self, backend: &str) -> Result<(), ToolError> {
-        if self.use_keychain {
-            keychain::delete(backend);
+        self.delete_inner(backend, |b| if self.use_keychain { keychain::delete(b) } else { DeleteOutcome::NotFound })
+    }
+
+    /// The deletion policy with the keychain call injected, so tests can fake a keychain failure.
+    fn delete_inner(&self, backend: &str, keychain_delete: impl FnOnce(&str) -> DeleteOutcome) -> Result<(), ToolError> {
+        let chain = keychain_delete(backend);
+        if chain == DeleteOutcome::Failed {
+            return Err(ToolError::new(ErrorCode::NoPermission, "The system keychain refused to remove the key."));
         }
         let mut t = self.read_file();
-        if t.remove(backend).is_some() {
+        let removed_file = t.remove(backend).is_some();
+        if removed_file {
             self.write_file(&t)?;
         }
-        Ok(())
+        match chain {
+            DeleteOutcome::Deleted | DeleteOutcome::NotFound => Ok(()),
+            // No OS keychain: the private fallback file is the store, so removing it is enough.
+            DeleteOutcome::Unavailable if removed_file => Ok(()),
+            DeleteOutcome::Unavailable => Err(ToolError::new(ErrorCode::NoPermission, "Couldn't reach the system keychain to remove the key.")),
+            DeleteOutcome::Failed => Err(ToolError::new(ErrorCode::NoPermission, "The system keychain refused to remove the key.")),
+        }
     }
 }
 
@@ -152,9 +176,21 @@ mod keychain {
         bounded(move || keyring::Entry::new(SERVICE, &b).ok()?.set_password(&k).ok()).is_some()
     }
 
-    pub fn delete(backend: &str) {
+    pub fn delete(backend: &str) -> super::DeleteOutcome {
+        use super::DeleteOutcome;
         let b = backend.to_string();
-        let _ = bounded(move || keyring::Entry::new(SERVICE, &b).ok()?.delete_credential().ok());
+        let result = bounded(move || match keyring::Entry::new(SERVICE, &b) {
+            Ok(entry) => match entry.delete_credential() {
+                Ok(()) => Some(DeleteOutcome::Deleted),
+                Err(keyring::Error::NoEntry) => Some(DeleteOutcome::NotFound),
+                Err(keyring::Error::NoStorageAccess(_)) => Some(DeleteOutcome::Unavailable),
+                Err(_) => Some(DeleteOutcome::Failed),
+            },
+            Err(keyring::Error::NoStorageAccess(_)) => Some(DeleteOutcome::Unavailable),
+            Err(_) => Some(DeleteOutcome::Failed),
+        });
+        // A timed-out or unstartable keychain call is a failure, never a silent success.
+        result.unwrap_or(DeleteOutcome::Failed)
     }
 }
 
@@ -167,7 +203,9 @@ mod keychain {
     pub fn set(_: &str, _: &str) -> bool {
         false
     }
-    pub fn delete(_: &str) {}
+    pub fn delete(_: &str) -> super::DeleteOutcome {
+        super::DeleteOutcome::Unavailable
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +244,24 @@ mod tests {
         s.delete(&asset_key_name("other")).unwrap();
         assert_eq!(asset_keys(&s, &providers).get("other"), None);
         assert_eq!(fal_key(&s).as_deref(), Some("f-1"));
+    }
+
+    #[test]
+    fn keychain_delete_failures_are_not_reported_as_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ai-keys.toml");
+        // file_only never touches the machine's keychain; delete_inner injects the keychain result.
+        let s = KeyStore::file_only(file.clone());
+        s.set("Claude", "sk-test").unwrap();
+        let err = s.delete_inner("Claude", |_| DeleteOutcome::Failed).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NoPermission);
+        assert!(s.get("Claude").is_some(), "a failed keychain delete still reports the fallback copy");
+        // A successful delete removes the fallback copy too.
+        s.delete_inner("Claude", |_| DeleteOutcome::NotFound).unwrap();
+        assert!(s.get("Claude").is_none());
+        // With nothing left in the fallback file, an unreachable keychain is an error, not success.
+        let err = s.delete_inner("Claude", |_| DeleteOutcome::Unavailable).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NoPermission);
     }
 
     #[test]

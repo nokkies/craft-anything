@@ -17,7 +17,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+static INSTALL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use crate::table::Install;
 pub use crate::table::{ArchiveFormat, Pin};
@@ -95,7 +98,8 @@ pub fn install(
     }
 
     std::fs::create_dir_all(store_dir).map_err(|e| ToolError::io(store_dir.display(), e))?;
-    let archive = store_dir.join(format!(".{engine_id}-{}.archive", std::process::id()));
+    let n = INSTALL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let archive = store_dir.join(format!(".{engine_id}-{}-{n}.archive", std::process::id()));
     report(&format!("downloading {}", pin.url));
     download_verified(pin.url, &archive, pin.sha256, MAX_ARCHIVE_BYTES, cancel.as_ref(), &|_, _| {})?;
     report("checksum verified");
@@ -103,10 +107,9 @@ pub fn install(
     let _ = std::fs::remove_file(&archive);
     let data = data?;
 
-    // Unpack into a sibling temp dir, then swap it into place.
-    let incoming = store_dir.join(format!(".{engine_id}.incoming-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&incoming);
-    std::fs::create_dir(&incoming).map_err(|e| ToolError::io(incoming.display(), e))?;
+    // Unpack into a unique sibling temp dir, then swap it into place without deleting the old
+    // install first: a failed swap rolls the old one back.
+    let incoming = unique_dir(store_dir, &format!(".{engine_id}.incoming"))?;
     let files_written = match unpack(&data, pin.format, &incoming, pin.strip_prefix, cancel.as_ref(), report) {
         Ok(n) => n,
         Err(e) => {
@@ -116,10 +119,9 @@ pub fn install(
     };
 
     let dest = store_dir.join(engine_id);
-    let _ = std::fs::remove_dir_all(&dest);
-    if let Err(e) = std::fs::rename(&incoming, &dest) {
+    if let Err(e) = swap_install(&incoming, &dest) {
         let _ = std::fs::remove_dir_all(&incoming);
-        return Err(ToolError::io(dest.display(), e));
+        return Err(e);
     }
 
     let located = crate::locate(engine_id, &NoOverrides, store_dir);
@@ -139,6 +141,52 @@ struct NoOverrides;
 impl crate::ToolPathLookup for NoOverrides {
     fn override_for(&self, _: &str) -> Option<PathBuf> {
         None
+    }
+}
+
+/// A sibling directory that doesn't exist yet, unique across threads and processes.
+fn unique_dir(parent: &Path, prefix: &str) -> Result<PathBuf, ToolError> {
+    for _ in 0..1024 {
+        let n = INSTALL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = parent.join(format!("{prefix}-{}-{n}", std::process::id()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(ToolError::io(dir.display(), e)),
+        }
+    }
+    Err(ToolError::io(parent.display(), std::io::Error::new(std::io::ErrorKind::AlreadyExists, "too many stale install folders")))
+}
+
+/// Move `incoming` into `dest`, keeping the previous install until the new one is in place. If the
+/// final rename fails, the previous install is rolled back; the caller removes `incoming`.
+fn swap_install(incoming: &Path, dest: &Path) -> Result<(), ToolError> {
+    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "engine".into());
+    let mut old: Option<PathBuf> = None;
+    if dest.exists() {
+        let aside = unique_dir(&parent, &format!(".{name}.old"))?;
+        // unique_dir created an empty placeholder; remove it so rename can move the old install there.
+        std::fs::remove_dir(&aside).map_err(|e| ToolError::io(aside.display(), e))?;
+        std::fs::rename(dest, &aside).map_err(|e| ToolError::io(dest.display(), e))?;
+        old = Some(aside);
+    }
+    match std::fs::rename(incoming, dest) {
+        Ok(()) => {
+            if let Some(old) = old {
+                let _ = std::fs::remove_dir_all(old);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(old) = old
+                && let Err(rollback) = std::fs::rename(&old, dest)
+            {
+                return Err(ToolError::io(dest.display(), e)
+                    .with_remediation(format!("The previous install is kept at {}; restoring it failed: {rollback}", old.display())));
+            }
+            Err(ToolError::io(dest.display(), e))
+        }
     }
 }
 
@@ -452,6 +500,26 @@ mod tests {
         let r = install(&id, Path::new(&store), None, None, &|_| {}).unwrap();
         assert!(r.files_written > 0, "{r:?}");
         assert!(r.located.as_ref().is_some_and(|p| p.is_file()), "installed but not found: {r:?}");
+    }
+
+    #[test]
+    fn install_swap_keeps_the_old_engine_until_the_new_one_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("engine");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("old.txt"), "old").unwrap();
+        let incoming = dir.path().join("incoming");
+        std::fs::create_dir(&incoming).unwrap();
+        std::fs::write(incoming.join("new.txt"), "new").unwrap();
+        swap_install(&incoming, &dest).unwrap();
+        assert!(dest.join("new.txt").is_file());
+        assert!(!dest.join("old.txt").exists());
+        assert!(!incoming.exists());
+        // A failed final rename rolls the old install back.
+        let missing = dir.path().join("missing");
+        let err = swap_install(&missing, &dest).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(dest.join("new.txt").is_file(), "the previous install is restored");
     }
 
     #[test]
