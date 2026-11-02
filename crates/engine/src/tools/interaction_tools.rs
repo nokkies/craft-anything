@@ -824,6 +824,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let game = dir.path().join("Games").join("Some Game");
         std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("data.ini"), "original").unwrap();
         let w = Workspace::create(&dir.path().join("projects"), "g", "Recreate this game", TargetRef::Local { path: game.clone() }).unwrap();
         let inbox = || Some(Inbox::new(w.inbox_dir()));
         let file = |p: &std::path::Path| json!({"file_path": p.join("data.ini").display().to_string()});
